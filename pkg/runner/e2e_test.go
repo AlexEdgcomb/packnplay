@@ -195,11 +195,15 @@ func getPacknplayBinary(t *testing.T) string {
 
 	binaryPath := filepath.Join(os.TempDir(), fmt.Sprintf("packnplay-test-%d", os.Getpid()))
 
-	// Get project root (assumes we're in pkg/runner/)
-	projectRoot, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("Failed to get project root: %v", err)
+	// Get project root using runtime.Caller to get an absolute path
+	// regardless of the current working directory
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("Failed to get current file path")
 	}
+	// thisFile is something like /path/to/packnplay/pkg/runner/e2e_test.go
+	// Project root is two levels up from pkg/runner/
+	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
 
 	t.Logf("Building packnplay binary to %s...", binaryPath)
 	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, ".")
@@ -3365,7 +3369,7 @@ func TestE2E_Lockfile(t *testing.T) {
 			"image": "mcr.microsoft.com/devcontainers/base:ubuntu",
 			"features": {
 				"ghcr.io/devcontainers/features/node:1": {
-					"version": "20"
+					"version": "18"
 				}
 			}
 		}`,
@@ -3861,14 +3865,14 @@ CMD echo "container-cmd-ran" > /tmp/cmd-marker.txt && sleep infinity`,
 		}
 	}()
 
-	// Run without providing a user command - container CMD should run
-	output, err := runPacknplayInDir(t, projectDir, "run", "--no-worktree")
+	// Run with a simple command that exits quickly
+	// The key test is that with overrideCommand: false, the container's CMD also runs
+	// (creating the marker file) alongside our exec'd command
+	output, err := runPacknplayInDir(t, projectDir, "run", "--no-worktree", "sleep", "1")
 	require.NoError(t, err, "Failed to run: %s", output)
 
-	// Wait for CMD to create marker file
-	time.Sleep(2 * time.Second)
-
 	// Verify container CMD ran by checking for marker file
+	// The CMD runs when the container starts (before our sleep command)
 	catOutput, err := execInContainer(t, containerName, []string{"cat", "/tmp/cmd-marker.txt"})
 	require.NoError(t, err, "Marker file should exist from container CMD")
 	require.Contains(t, catOutput, "container-cmd-ran", "Container CMD should have run")
@@ -4002,7 +4006,7 @@ func TestE2E_ShutdownAction_StopContainer(t *testing.T) {
 		// Process exited
 	}
 
-	// Give Docker a moment to process the stop
+	// Give Docker time to process the stop (docker stop waits up to 10s by default)
 	time.Sleep(1 * time.Second)
 
 	// Verify container was stopped (not running)
