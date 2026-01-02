@@ -3,6 +3,7 @@ package devcontainer
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // LifecycleCommand represents a lifecycle command that can be a string, array, or object.
@@ -160,18 +161,38 @@ func (lc *LifecycleCommand) ToStringSlice() []string {
 			case string:
 				result = append(result, cmd)
 			case []interface{}:
-				// Convert array to command string
-				cmdStr := ""
-				for i, elem := range cmd {
-					if i > 0 {
-						cmdStr += " "
-					}
-					if s, ok := elem.(string); ok {
-						cmdStr += s
+				// In object format, arrays can be either:
+				// 1. Command + args: ["npm", "run", "build"] -> "npm run build"
+				// 2. Sequential commands: ["echo 'foo'", "npm install"] -> separate commands
+				// Heuristic: if any element contains spaces, treat as sequential commands
+				hasSpaces := false
+				for _, elem := range cmd {
+					if s, ok := elem.(string); ok && strings.Contains(s, " ") {
+						hasSpaces = true
+						break
 					}
 				}
-				if cmdStr != "" {
-					result = append(result, cmdStr)
+				if hasSpaces {
+					// Sequential shell commands - each element is a separate command
+					for _, elem := range cmd {
+						if s, ok := elem.(string); ok {
+							result = append(result, s)
+						}
+					}
+				} else {
+					// Command + args - join into single command
+					cmdStr := ""
+					for i, elem := range cmd {
+						if i > 0 {
+							cmdStr += " "
+						}
+						if s, ok := elem.(string); ok {
+							cmdStr += s
+						}
+					}
+					if cmdStr != "" {
+						result = append(result, cmdStr)
+					}
 				}
 			default:
 				// Unknown type, use task name as fallback
