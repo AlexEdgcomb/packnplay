@@ -1,6 +1,9 @@
 package devcontainer
 
 import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,11 +11,17 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
+	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
 // OptionSpec represents a feature option specification
@@ -177,11 +186,11 @@ func isOCIReference(ref string) bool {
 //   docker login ghcr.io
 //   docker login myregistry.com
 //
-// ORAS (the tool used to pull OCI artifacts) automatically reads credentials from the same
-// location as Docker, enabling seamless access to private features without additional configuration.
+// The oras-go library automatically reads credentials from the same location as Docker,
+// enabling seamless access to private features without additional configuration.
 // See: https://oras.land/docs/how_to_guides/authentication/
 //
-// For credential helpers (Docker Desktop, cloud provider helpers), ORAS also inherits those
+// For credential helpers (Docker Desktop, cloud provider helpers), those are also inherited
 // automatically, as they're configured in the same Docker config file.
 func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 	// Create cache directory if it doesn't exist
@@ -201,40 +210,117 @@ func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 		return featureCacheDir, nil
 	}
 
-	// Create temporary directory for extraction
+	// Create cache directory for extraction
 	if err := os.MkdirAll(featureCacheDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create feature cache directory: %w", err)
 	}
 
-	// Use oras to pull the OCI artifact
-	cmd := exec.Command("oras", "pull", "--output", featureCacheDir, ociRef)
-	output, err := cmd.CombinedOutput()
+	// Create context with timeout for the pull operation
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Connect to the remote repository
+	repo, err := remote.NewRepository(ociRef)
 	if err != nil {
-		return "", fmt.Errorf("failed to pull OCI feature %s (is 'oras' installed?): %w\nOutput: %s", ociRef, err, string(output))
+		return "", fmt.Errorf("failed to create repository for %s: %w", ociRef, err)
 	}
 
-	// Extract the tarball that oras downloaded
-	// Find the .tgz file in the cache directory
-	entries, err := os.ReadDir(featureCacheDir)
+	// Set up authentication using Docker credentials
+	credStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
 	if err != nil {
-		return "", fmt.Errorf("failed to read cache directory: %w", err)
-	}
-
-	var tarballPath string
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".tgz") || strings.HasSuffix(entry.Name(), ".tar.gz") {
-			tarballPath = filepath.Join(featureCacheDir, entry.Name())
-			break
+		// If we can't load Docker credentials, continue without auth (for public registries)
+		// This matches the behavior of the oras CLI
+		repo.Client = retry.DefaultClient
+	} else {
+		repo.Client = &auth.Client{
+			Client:     retry.DefaultClient,
+			Cache:      auth.NewCache(),
+			Credential: credentials.Credential(credStore),
 		}
 	}
 
-	if tarballPath == "" {
-		return "", fmt.Errorf("no tarball found in cache directory after OCI pull")
+	// Parse the tag from the reference (e.g., "2" from "ghcr.io/devcontainers/features/common-utils:2")
+	tag := "latest"
+	if idx := strings.LastIndex(ociRef, ":"); idx != -1 {
+		possibleTag := ociRef[idx+1:]
+		// Make sure it's not a port number (check if we're past any slash)
+		if !strings.Contains(possibleTag, "/") {
+			tag = possibleTag
+		}
+	}
+
+	// Resolve the manifest to get the layer information
+	manifestDesc, err := repo.Resolve(ctx, tag)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve manifest for %s: %w", ociRef, err)
+	}
+
+	// Fetch the manifest content
+	manifestReader, err := repo.Fetch(ctx, manifestDesc)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch manifest for %s: %w", ociRef, err)
+	}
+	manifestBytes, err := io.ReadAll(manifestReader)
+	manifestReader.Close()
+	if err != nil {
+		return "", fmt.Errorf("failed to read manifest: %w", err)
+	}
+
+	// Parse the manifest to find layers
+	var manifest struct {
+		Layers []struct {
+			MediaType string `json:"mediaType"`
+			Digest    string `json:"digest"`
+			Size      int64  `json:"size"`
+		} `json:"layers"`
+	}
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return "", fmt.Errorf("failed to parse manifest: %w", err)
+	}
+
+	if len(manifest.Layers) == 0 {
+		return "", fmt.Errorf("no layers found in OCI feature manifest")
+	}
+
+	// Fetch the first layer (the feature tarball)
+	// Devcontainer features have a single layer which is the .tgz file
+	layer := manifest.Layers[0]
+
+	// Create a descriptor for the layer
+	layerDesc := ocispec.Descriptor{
+		MediaType: layer.MediaType,
+		Digest:    digest.Digest(layer.Digest),
+		Size:      layer.Size,
+	}
+
+	// Fetch the layer content
+	layerReader, err := repo.Fetch(ctx, layerDesc)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch layer: %w", err)
+	}
+	defer layerReader.Close()
+
+	// Save the layer to a temporary file
+	tarballPath := filepath.Join(featureCacheDir, "feature.tgz")
+	tarballFile, err := os.Create(tarballPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create tarball file: %w", err)
+	}
+
+	// Copy with size limit to prevent issues
+	const maxLayerSize = 100 * 1024 * 1024 // 100MB
+	n, err := io.CopyN(tarballFile, layerReader, maxLayerSize)
+	tarballFile.Close()
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("failed to write layer content: %w", err)
+	}
+	if n == maxLayerSize {
+		return "", fmt.Errorf("feature layer exceeds maximum size of 100MB")
 	}
 
 	// Extract tarball to the cache directory
-	cmd = exec.Command("tar", "-xf", tarballPath, "-C", featureCacheDir)
-	if err := cmd.Run(); err != nil {
+	// The extractTarball function auto-detects compression via magic bytes
+	if err := extractTarball(tarballPath, featureCacheDir, layer.MediaType); err != nil {
 		return "", fmt.Errorf("failed to extract tarball: %w", err)
 	}
 
@@ -242,6 +328,108 @@ func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 	_ = os.Remove(tarballPath)
 
 	return featureCacheDir, nil
+}
+
+// extractTarball extracts a tarball to the specified directory
+// It handles both gzip-compressed and uncompressed tar archives based on file magic bytes
+func extractTarball(tarballPath, destDir, mediaType string) error {
+	f, err := os.Open(tarballPath)
+	if err != nil {
+		return fmt.Errorf("failed to open tarball: %w", err)
+	}
+	defer f.Close()
+
+	// Check for gzip magic bytes (1f 8b) to detect compression
+	// This is the most reliable way - file magic bytes are the source of truth
+	magic := make([]byte, 2)
+	if _, err := f.Read(magic); err != nil {
+		return fmt.Errorf("failed to read file header: %w", err)
+	}
+	// Seek back to start
+	if _, err := f.Seek(0, 0); err != nil {
+		return fmt.Errorf("failed to seek: %w", err)
+	}
+
+	var tr *tar.Reader
+	// Only use gzip if magic bytes confirm it's gzip (0x1f 0x8b)
+	// Don't rely on file extension or media type as they can be misleading
+	isGzip := magic[0] == 0x1f && magic[1] == 0x8b
+
+	if isGzip {
+		gzr, err := gzip.NewReader(f)
+		if err != nil {
+			return fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer gzr.Close()
+		tr = tar.NewReader(gzr)
+	} else {
+		tr = tar.NewReader(f)
+	}
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar entry: %w", err)
+		}
+
+		// Sanitize the path to prevent directory traversal attacks
+		// Clean the path and ensure it doesn't escape the destination directory
+		cleanName := filepath.Clean(header.Name)
+		if strings.HasPrefix(cleanName, "..") || filepath.IsAbs(cleanName) {
+			continue // Skip potentially dangerous paths
+		}
+
+		target := filepath.Join(destDir, cleanName)
+
+		// Ensure the target is within destDir (defense in depth)
+		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(destDir)) {
+			continue
+		}
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
+				return fmt.Errorf("failed to create directory %s: %w", target, err)
+			}
+		case tar.TypeReg:
+			// Ensure parent directory exists
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory for %s: %w", target, err)
+			}
+
+			outFile, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				return fmt.Errorf("failed to create file %s: %w", target, err)
+			}
+
+			// Limit copy size to prevent zip bombs (100MB per file)
+			const maxFileSize = 100 * 1024 * 1024
+			if _, err := io.CopyN(outFile, tr, maxFileSize); err != nil && err != io.EOF {
+				outFile.Close()
+				return fmt.Errorf("failed to write file %s: %w", target, err)
+			}
+			outFile.Close()
+		case tar.TypeSymlink:
+			// Handle symlinks - ensure they don't escape destDir
+			linkTarget := header.Linkname
+			if filepath.IsAbs(linkTarget) {
+				continue // Skip absolute symlinks
+			}
+			resolvedLink := filepath.Join(filepath.Dir(target), linkTarget)
+			if !strings.HasPrefix(filepath.Clean(resolvedLink), filepath.Clean(destDir)) {
+				continue // Skip symlinks that would escape destDir
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
+				// Ignore symlink errors - some systems may not support them
+				continue
+			}
+		}
+	}
+
+	return nil
 }
 
 // hashURL generates a cache-safe hash of a URL
@@ -327,11 +515,9 @@ func (r *FeatureResolver) downloadHTTPSFeature(url string) (string, error) {
 	// Close file before extraction
 	tmpFile.Close()
 
-	// Extract tarball to cache directory
-	// Note: tar automatically strips leading / and prevents absolute paths by default
-	// unless -P flag is used. We intentionally omit -P for security.
-	cmd := exec.Command("tar", "-xf", tmpFile.Name(), "-C", featureCacheDir)
-	if err := cmd.Run(); err != nil {
+	// Extract tarball to cache directory using Go's archive/tar
+	// The extractTarball function handles security (path traversal prevention)
+	if err := extractTarball(tmpFile.Name(), featureCacheDir, contentType); err != nil {
 		return "", fmt.Errorf("failed to extract tarball: %w", err)
 	}
 
