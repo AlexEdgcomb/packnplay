@@ -1,6 +1,7 @@
 package devcontainer
 
 import (
+	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -69,24 +70,24 @@ type FeatureMetadata struct {
 func (f *FeatureMetadata) UnmarshalJSON(data []byte) error {
 	// Create a temporary struct with Entrypoint removed to avoid infinite recursion
 	type Alias struct {
-		ID                   string                `json:"id"`
-		Version              string                `json:"version"`
-		Name                 string                `json:"name"`
-		Description          string                `json:"description,omitempty"`
-		Options              map[string]OptionSpec `json:"options,omitempty"`
-		ContainerEnv         map[string]string     `json:"containerEnv,omitempty"`
-		Privileged           *bool                 `json:"privileged,omitempty"`
-		Init                 *bool                 `json:"init,omitempty"`
-		CapAdd               []string              `json:"capAdd,omitempty"`
-		SecurityOpt          []string              `json:"securityOpt,omitempty"`
-		Mounts               []Mount               `json:"mounts,omitempty"`
-		OnCreateCommand      *LifecycleCommand     `json:"onCreateCommand,omitempty"`
-		UpdateContentCommand *LifecycleCommand     `json:"updateContentCommand,omitempty"`
-		PostCreateCommand    *LifecycleCommand     `json:"postCreateCommand,omitempty"`
-		PostStartCommand     *LifecycleCommand     `json:"postStartCommand,omitempty"`
-		PostAttachCommand    *LifecycleCommand     `json:"postAttachCommand,omitempty"`
+		ID                   string                 `json:"id"`
+		Version              string                 `json:"version"`
+		Name                 string                 `json:"name"`
+		Description          string                 `json:"description,omitempty"`
+		Options              map[string]OptionSpec  `json:"options,omitempty"`
+		ContainerEnv         map[string]string      `json:"containerEnv,omitempty"`
+		Privileged           *bool                  `json:"privileged,omitempty"`
+		Init                 *bool                  `json:"init,omitempty"`
+		CapAdd               []string               `json:"capAdd,omitempty"`
+		SecurityOpt          []string               `json:"securityOpt,omitempty"`
+		Mounts               []Mount                `json:"mounts,omitempty"`
+		OnCreateCommand      *LifecycleCommand      `json:"onCreateCommand,omitempty"`
+		UpdateContentCommand *LifecycleCommand      `json:"updateContentCommand,omitempty"`
+		PostCreateCommand    *LifecycleCommand      `json:"postCreateCommand,omitempty"`
+		PostStartCommand     *LifecycleCommand      `json:"postStartCommand,omitempty"`
+		PostAttachCommand    *LifecycleCommand      `json:"postAttachCommand,omitempty"`
 		DependsOn            map[string]interface{} `json:"dependsOn,omitempty"`
-		InstallsAfter        []string              `json:"installsAfter,omitempty"`
+		InstallsAfter        []string               `json:"installsAfter,omitempty"`
 	}
 
 	var aux Alias
@@ -170,19 +171,11 @@ func isOCIReference(ref string) bool {
 	return strings.Contains(ref, "ghcr.io/") || strings.Contains(ref, "mcr.microsoft.com/")
 }
 
-// pullOCIFeature pulls an OCI feature to the cache directory
+// pullOCIFeature pulls an OCI feature from a registry using Docker.
+// Docker must be installed and available in PATH.
 //
-// Authentication: This function automatically inherits Docker credentials from ~/.docker/config.json.
-// Users can authenticate to private registries using standard Docker login:
-//   docker login ghcr.io
-//   docker login myregistry.com
-//
-// ORAS (the tool used to pull OCI artifacts) automatically reads credentials from the same
-// location as Docker, enabling seamless access to private features without additional configuration.
-// See: https://oras.land/docs/how_to_guides/authentication/
-//
-// For credential helpers (Docker Desktop, cloud provider helpers), ORAS also inherits those
-// automatically, as they're configured in the same Docker config file.
+// Authentication is handled by Docker - users should configure registry
+// credentials using `docker login` as they normally would.
 func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 	// Create cache directory if it doesn't exist
 	if err := os.MkdirAll(r.cacheDir, 0755); err != nil {
@@ -201,47 +194,111 @@ func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 		return featureCacheDir, nil
 	}
 
-	// Create temporary directory for extraction
+	// Create cache directory for extraction
 	if err := os.MkdirAll(featureCacheDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create feature cache directory: %w", err)
 	}
 
-	// Use oras to pull the OCI artifact
-	cmd := exec.Command("oras", "pull", "--output", featureCacheDir, ociRef)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("failed to pull OCI feature %s (is 'oras' installed?): %w\nOutput: %s", ociRef, err, string(output))
+	// Pull the OCI artifact using Docker
+	pullCmd := exec.Command("docker", "pull", "--quiet", ociRef)
+	if output, err := pullCmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to pull OCI feature %s: %w\nOutput: %s", ociRef, err, string(output))
 	}
 
-	// Extract the tarball that oras downloaded
-	// Find the .tgz file in the cache directory
-	entries, err := os.ReadDir(featureCacheDir)
+	// Use docker save to get the image layers, then extract the feature tarball
+	saveCmd := exec.Command("docker", "save", ociRef)
+	saveOutput, err := saveCmd.StdoutPipe()
 	if err != nil {
-		return "", fmt.Errorf("failed to read cache directory: %w", err)
+		return "", fmt.Errorf("failed to create pipe for docker save: %w", err)
 	}
 
-	var tarballPath string
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), ".tgz") || strings.HasSuffix(entry.Name(), ".tar.gz") {
-			tarballPath = filepath.Join(featureCacheDir, entry.Name())
+	if err := saveCmd.Start(); err != nil {
+		return "", fmt.Errorf("failed to start docker save: %w", err)
+	}
+
+	// Parse the tar stream from docker save to find the layer blob
+	layerPath, err := findLayerPathFromDockerSave(saveOutput)
+	if err != nil {
+		saveCmd.Wait()
+		return "", fmt.Errorf("failed to parse docker save output: %w", err)
+	}
+
+	// We need to run docker save again to extract the actual layer
+	// (the first run was just to find the layer path)
+	saveCmd.Wait()
+
+	// Now extract the layer blob using docker save piped to tar
+	if err := extractLayerFromDockerSave(ociRef, layerPath, featureCacheDir); err != nil {
+		return "", fmt.Errorf("failed to extract feature layer: %w", err)
+	}
+
+	return featureCacheDir, nil
+}
+
+// findLayerPathFromDockerSave parses the tar stream from docker save to find the layer blob path
+func findLayerPathFromDockerSave(r io.Reader) (string, error) {
+	tr := tar.NewReader(r)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
 			break
+		}
+		if err != nil {
+			return "", err
+		}
+
+		if header.Name == "manifest.json" {
+			var manifests []struct {
+				Layers []string `json:"Layers"`
+			}
+			if err := json.NewDecoder(tr).Decode(&manifests); err != nil {
+				return "", fmt.Errorf("failed to decode manifest.json: %w", err)
+			}
+			if len(manifests) == 0 || len(manifests[0].Layers) == 0 {
+				return "", fmt.Errorf("no layers found in manifest")
+			}
+			return manifests[0].Layers[0], nil
 		}
 	}
 
-	if tarballPath == "" {
-		return "", fmt.Errorf("no tarball found in cache directory after OCI pull")
+	return "", fmt.Errorf("manifest.json not found")
+}
+
+// extractLayerFromDockerSave runs docker save and extracts the specified layer to destDir
+func extractLayerFromDockerSave(ociRef, layerPath, destDir string) error {
+	saveCmd := exec.Command("docker", "save", ociRef)
+	saveOutput, err := saveCmd.StdoutPipe()
+	if err != nil {
+		return err
 	}
 
-	// Extract tarball to the cache directory
-	cmd = exec.Command("tar", "-xf", tarballPath, "-C", featureCacheDir)
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to extract tarball: %w", err)
+	if err := saveCmd.Start(); err != nil {
+		return err
 	}
+	defer saveCmd.Wait()
 
-	// Remove the tarball after extraction
-	_ = os.Remove(tarballPath)
+	tr := tar.NewReader(saveOutput)
 
-	return featureCacheDir, nil
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			return fmt.Errorf("layer %s not found in docker save output", layerPath)
+		}
+		if err != nil {
+			return err
+		}
+
+		if header.Name == layerPath {
+			// Found the layer blob - extract it using system tar
+			tarCmd := exec.Command("tar", "-xf", "-", "-C", destDir)
+			tarCmd.Stdin = tr
+			if output, err := tarCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("tar extraction failed: %w\nOutput: %s", err, string(output))
+			}
+			return nil
+		}
+	}
 }
 
 // hashURL generates a cache-safe hash of a URL
