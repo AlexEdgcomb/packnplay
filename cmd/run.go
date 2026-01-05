@@ -35,10 +35,12 @@ var (
 )
 
 var runCmd = &cobra.Command{
-	Use:           "run [flags] [command...]",
-	Short:         "Run command in container",
-	Long:          `Start a container and execute the specified command inside it.`,
-	Args:          cobra.MinimumNArgs(1),
+	Use:   "run [flags] [command...]",
+	Short: "Run command in container",
+	Long: `Start a container and execute the specified command inside it.
+If overrideCommand is set to false in devcontainer.json, the command is optional
+and the container's default CMD will be used.`,
+	Args:          cobra.ArbitraryArgs,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {

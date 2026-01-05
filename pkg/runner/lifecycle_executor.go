@@ -156,7 +156,13 @@ func (le *LifecycleExecutor) executeParallelCommands(commands map[string]interfa
 						return
 					}
 				}
-				err = le.executeDirectCommand(strArray)
+				// In object format, arrays are sequential shell commands to execute
+				// Each element is a separate command string, not command + args
+				for _, cmdStr := range strArray {
+					if err = le.executeShellCommand(cmdStr); err != nil {
+						break
+					}
+				}
 			default:
 				err = fmt.Errorf("task %s: invalid command type: %T", taskName, taskCmd)
 			}

@@ -37,12 +37,12 @@ type RunConfig struct {
 	DefaultImage          string // default container image to use
 	Command               []string
 	Credentials           config.Credentials
-	DefaultEnvVars        []string // API keys to proxy from host
-	PublishPorts          []string // Port mappings to publish to host
-	HostPath              string   // Host directory path for the container
-	LaunchCommand         string   // Original command line used to launch
-	WorkspaceMount        string   // Custom workspace mount (Docker --mount syntax)
-	WorkspaceFolder       string   // Container workspace folder path
+	DefaultEnvVars        []string                        // API keys to proxy from host
+	PublishPorts          []string                        // Port mappings to publish to host
+	HostPath              string                          // Host directory path for the container
+	LaunchCommand         string                          // Original command line used to launch
+	WorkspaceMount        string                          // Custom workspace mount (Docker --mount syntax)
+	WorkspaceFolder       string                          // Container workspace folder path
 	WorkspaceMountContext *devcontainer.SubstituteContext // Context for variable substitution in workspaceMount
 }
 
@@ -85,7 +85,6 @@ func (a *FeaturePropertiesApplier) ApplyFeatureProperties(baseArgs []string, fea
 		}
 
 		metadata := feature.Metadata
-
 
 		// Apply security properties
 		if metadata.Privileged != nil && *metadata.Privileged {
@@ -206,10 +205,19 @@ func execIntoContainer(dockerClient *docker.Client, containerID string, remoteUs
 
 	execArgs = append(execArgs, "-w", workingDir, containerID)
 
-	// Only append command if overrideCommand is true
-	// When false, the container's default CMD will run
-	if overrideCommand {
+	// Append the command to exec
+	// When overrideCommand is false and no user command is provided,
+	// default to a shell so the user can interact with the container
+	// while the container's CMD runs in the background
+	if len(command) > 0 {
 		execArgs = append(execArgs, command...)
+	} else if !overrideCommand {
+		// No command provided with overrideCommand: false
+		// Exec a default shell while container's CMD runs in background
+		execArgs = append(execArgs, "/bin/sh")
+	} else {
+		// Defensive: validation should prevent this path
+		return fmt.Errorf("internal error: overrideCommand is true but no command provided")
 	}
 
 	// If shutdownAction is set, run as child process with signal handling
@@ -409,6 +417,12 @@ func Run(config *RunConfig) error {
 		// Use configured default image (supports custom default containers)
 		defaultImage := getConfiguredDefaultImage(config)
 		devConfig = devcontainer.GetDefaultConfig(defaultImage)
+	}
+
+	// Step 3.1: Validate command is provided when overrideCommand is true (default)
+	// When overrideCommand is false, the container's CMD is used instead
+	if devConfig.ShouldOverrideCommand() && len(config.Command) == 0 {
+		return fmt.Errorf("a command is required (or set overrideCommand: false in devcontainer.json to use container's default CMD)")
 	}
 
 	// Step 3.5: Detect orchestration mode and route accordingly
@@ -1237,18 +1251,22 @@ func Run(config *RunConfig) error {
 	}
 	args = append(args, imageName)
 
-	// Add signal-aware command that keeps container alive (Microsoft pattern)
-	// This provides graceful shutdown handling for SIGTERM/SIGINT
-	// If a feature provides entrypoint args (e.g., ["/bin/sh", "-c"]), prepend them to the command
-	if len(entrypointArgs) > 0 {
-		// Feature provided an entrypoint like ["/bin/sh", "-c"]
-		// The first element is set via --entrypoint, remaining elements are command args
-		args = append(args, entrypointArgs...)
-		args = append(args, "echo 'Container started' && trap 'exit 0' 15 && while true; do sleep 1 & wait $!; done")
-	} else {
-		// No feature entrypoint, use default /bin/sh -c wrapper
-		args = append(args, "/bin/sh", "-c", "echo 'Container started' && trap 'exit 0' 15 && while true; do sleep 1 & wait $!; done")
+	// Add container command based on overrideCommand setting
+	if devConfig.ShouldOverrideCommand() {
+		// Add signal-aware command that keeps container alive (Microsoft pattern)
+		// This provides graceful shutdown handling for SIGTERM/SIGINT
+		// If a feature provides entrypoint args (e.g., ["/bin/sh", "-c"]), prepend them to the command
+		if len(entrypointArgs) > 0 {
+			// Feature provided an entrypoint like ["/bin/sh", "-c"]
+			// The first element is set via --entrypoint, remaining elements are command args
+			args = append(args, entrypointArgs...)
+			args = append(args, "echo 'Container started' && trap 'exit 0' 15 && while true; do sleep 1 & wait $!; done")
+		} else {
+			// No feature entrypoint, use default /bin/sh -c wrapper
+			args = append(args, "/bin/sh", "-c", "echo 'Container started' && trap 'exit 0' 15 && while true; do sleep 1 & wait $!; done")
+		}
 	}
+	// When overrideCommand is false, don't add a command - let the container's CMD run
 
 	// Step 9: Start container in background
 	if config.Verbose {
@@ -1469,24 +1487,8 @@ func Run(config *RunConfig) error {
 	}
 
 	// Step 12: Exec into container with user's command
-	cmdPath, err := exec.LookPath(dockerClient.Command())
-	if err != nil {
-		return fmt.Errorf("failed to find docker command: %w", err)
-	}
-
-	execArgs := []string{filepath.Base(cmdPath), "exec"}
-	execArgs = append(execArgs, getTTYFlags()...)
-
-	// Add user flag to exec if remoteUser is specified
-	if devConfig.RemoteUser != "" {
-		execArgs = append(execArgs, "--user", devConfig.RemoteUser)
-	}
-
-	execArgs = append(execArgs, "-w", workingDir, containerID)
-	execArgs = append(execArgs, config.Command...)
-
-	// Use syscall.Exec to replace current process
-	return syscall.Exec(cmdPath, execArgs, os.Environ())
+	// Use execIntoContainer which handles shutdownAction for signal-based cleanup
+	return execIntoContainer(dockerClient, containerID, devConfig.RemoteUser, workingDir, config.Command, devConfig.ShouldOverrideCommand(), devConfig.ShutdownAction, nil, "")
 }
 
 // runWithCompose handles Docker Compose orchestration
@@ -1502,12 +1504,14 @@ func runWithCompose(devConfig *devcontainer.Config, config *RunConfig, mountPath
 	}
 
 	// Convert relative compose file paths to absolute paths
+	// Paths in devcontainer.json are relative to the .devcontainer directory
 	absoluteComposeFiles := make([]string, len(composeFiles))
+	devcontainerDir := filepath.Join(mountPath, ".devcontainer")
 	for i, f := range composeFiles {
 		if filepath.IsAbs(f) {
 			absoluteComposeFiles[i] = f
 		} else {
-			absoluteComposeFiles[i] = filepath.Join(mountPath, f)
+			absoluteComposeFiles[i] = filepath.Join(devcontainerDir, f)
 		}
 	}
 
