@@ -217,8 +217,8 @@ func execIntoContainer(dockerClient *docker.Client, containerID string, remoteUs
 		// Exec a default shell while container's CMD runs in background
 		execArgs = append(execArgs, "/bin/sh")
 	} else {
-		// This shouldn't happen - validation should catch this earlier
-		execArgs = append(execArgs, command...)
+		// Defensive: validation should prevent this path
+		return fmt.Errorf("internal error: overrideCommand is true but no command provided")
 	}
 
 	// If shutdownAction is set, run as child process with signal handling

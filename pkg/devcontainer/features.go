@@ -307,14 +307,14 @@ func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 		return "", fmt.Errorf("failed to create tarball file: %w", err)
 	}
 
-	// Copy with size limit to prevent issues
+	// Copy with size limit to prevent issues (read one extra byte to detect oversized layers)
 	const maxLayerSize = 100 * 1024 * 1024 // 100MB
-	n, err := io.CopyN(tarballFile, layerReader, maxLayerSize)
+	n, err := io.CopyN(tarballFile, layerReader, maxLayerSize+1)
 	tarballFile.Close()
 	if err != nil && err != io.EOF {
 		return "", fmt.Errorf("failed to write layer content: %w", err)
 	}
-	if n == maxLayerSize {
+	if n > maxLayerSize {
 		return "", fmt.Errorf("feature layer exceeds maximum size of 100MB")
 	}
 
@@ -405,13 +405,16 @@ func extractTarball(tarballPath, destDir, mediaType string) error {
 				return fmt.Errorf("failed to create file %s: %w", target, err)
 			}
 
-			// Limit copy size to prevent zip bombs (100MB per file)
+			// Limit copy size to prevent decompression bombs (100MB per file)
 			const maxFileSize = 100 * 1024 * 1024
-			if _, err := io.CopyN(outFile, tr, maxFileSize); err != nil && err != io.EOF {
-				outFile.Close()
+			n, err := io.CopyN(outFile, tr, maxFileSize+1)
+			outFile.Close()
+			if err != nil && err != io.EOF {
 				return fmt.Errorf("failed to write file %s: %w", target, err)
 			}
-			outFile.Close()
+			if n > maxFileSize {
+				return fmt.Errorf("file %s exceeds maximum size of 100MB", target)
+			}
 		case tar.TypeSymlink:
 			// Handle symlinks - ensure they don't escape destDir
 			linkTarget := header.Linkname
