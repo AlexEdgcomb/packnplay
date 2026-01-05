@@ -2,6 +2,7 @@ package devcontainer
 
 import (
 	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -176,7 +177,7 @@ func isOCIReference(ref string) bool {
 //
 // Authentication is handled by Docker - users should configure registry
 // credentials using `docker login` as they normally would.
-func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
+func (r *FeatureResolver) pullOCIFeature(ociRef string) (resultPath string, err error) {
 	// Create cache directory if it doesn't exist
 	if err := os.MkdirAll(r.cacheDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create cache directory: %w", err)
@@ -199,6 +200,13 @@ func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 		return "", fmt.Errorf("failed to create feature cache directory: %w", err)
 	}
 
+	// Cleanup on failure: if we return with an error, remove the cache directory
+	defer func() {
+		if err != nil {
+			os.RemoveAll(featureCacheDir)
+		}
+	}()
+
 	// Pull the OCI artifact using Docker
 	pullCmd := exec.Command("docker", "pull", "--quiet", ociRef)
 	if output, err := pullCmd.CombinedOutput(); err != nil {
@@ -206,38 +214,36 @@ func (r *FeatureResolver) pullOCIFeature(ociRef string) (string, error) {
 	}
 
 	// Use docker save to get the image layers, then extract the feature tarball
-	saveCmd := exec.Command("docker", "save", ociRef)
-	saveOutput, err := saveCmd.StdoutPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to create pipe for docker save: %w", err)
-	}
-
-	if err := saveCmd.Start(); err != nil {
-		return "", fmt.Errorf("failed to start docker save: %w", err)
-	}
-
-	// Parse the tar stream from docker save to find the layer blob
-	layerPath, err := findLayerPathFromDockerSave(saveOutput)
-	if err != nil {
-		saveCmd.Wait()
-		return "", fmt.Errorf("failed to parse docker save output: %w", err)
-	}
-
-	// We need to run docker save again to extract the actual layer
-	// (the first run was just to find the layer path)
-	saveCmd.Wait()
-
-	// Now extract the layer blob using docker save piped to tar
-	if err := extractLayerFromDockerSave(ociRef, layerPath, featureCacheDir); err != nil {
-		return "", fmt.Errorf("failed to extract feature layer: %w", err)
+	// Process in a single pass: find manifest.json first, then extract the layer
+	if err := extractFeatureFromDockerSave(ociRef, featureCacheDir); err != nil {
+		return "", fmt.Errorf("failed to extract feature from docker save: %w", err)
 	}
 
 	return featureCacheDir, nil
 }
 
-// findLayerPathFromDockerSave parses the tar stream from docker save to find the layer blob path
-func findLayerPathFromDockerSave(r io.Reader) (string, error) {
-	tr := tar.NewReader(r)
+// extractFeatureFromDockerSave runs docker save once and extracts the feature layer in a single pass.
+// It reads the tar stream sequentially, buffering blob entries until manifest.json is found.
+// Since blobs typically appear before manifest.json in docker save output, we buffer them
+// and then extract the correct one once we know which layer we need.
+func extractFeatureFromDockerSave(ociRef, destDir string) error {
+	saveCmd := exec.Command("docker", "save", ociRef)
+	saveOutput, err := saveCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create pipe for docker save: %w", err)
+	}
+
+	if err := saveCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start docker save: %w", err)
+	}
+	defer saveCmd.Wait()
+
+	tr := tar.NewReader(saveOutput)
+
+	// Buffer blob contents as we encounter them (before we know which one we need)
+	// Feature layers are typically small (< 1MB), so buffering is acceptable
+	blobs := make(map[string][]byte)
+	var layerPath string
 
 	for {
 		header, err := tr.Next()
@@ -245,60 +251,54 @@ func findLayerPathFromDockerSave(r io.Reader) (string, error) {
 			break
 		}
 		if err != nil {
-			return "", err
+			return fmt.Errorf("error reading tar stream: %w", err)
+		}
+
+		// Buffer blob entries - we'll need one of them but don't know which yet
+		if strings.HasPrefix(header.Name, "blobs/") {
+			content, err := io.ReadAll(tr)
+			if err != nil {
+				return fmt.Errorf("failed to read blob %s: %w", header.Name, err)
+			}
+			blobs[header.Name] = content
+			continue
 		}
 
 		if header.Name == "manifest.json" {
+			// Parse manifest to get the layer path
 			var manifests []struct {
 				Layers []string `json:"Layers"`
 			}
 			if err := json.NewDecoder(tr).Decode(&manifests); err != nil {
-				return "", fmt.Errorf("failed to decode manifest.json: %w", err)
+				return fmt.Errorf("failed to decode manifest.json: %w", err)
 			}
 			if len(manifests) == 0 || len(manifests[0].Layers) == 0 {
-				return "", fmt.Errorf("no layers found in manifest")
+				return fmt.Errorf("no layers found in manifest")
 			}
-			return manifests[0].Layers[0], nil
+			layerPath = manifests[0].Layers[0]
+			// Don't break - continue reading to ensure clean exit
+			continue
 		}
 	}
 
-	return "", fmt.Errorf("manifest.json not found")
-}
-
-// extractLayerFromDockerSave runs docker save and extracts the specified layer to destDir
-func extractLayerFromDockerSave(ociRef, layerPath, destDir string) error {
-	saveCmd := exec.Command("docker", "save", ociRef)
-	saveOutput, err := saveCmd.StdoutPipe()
-	if err != nil {
-		return err
+	if layerPath == "" {
+		return fmt.Errorf("manifest.json not found in docker save output")
 	}
 
-	if err := saveCmd.Start(); err != nil {
-		return err
+	// Find the layer in our buffered blobs
+	layerContent, exists := blobs[layerPath]
+	if !exists {
+		return fmt.Errorf("layer %s not found in docker save output", layerPath)
 	}
-	defer saveCmd.Wait()
 
-	tr := tar.NewReader(saveOutput)
-
-	for {
-		header, err := tr.Next()
-		if err == io.EOF {
-			return fmt.Errorf("layer %s not found in docker save output", layerPath)
-		}
-		if err != nil {
-			return err
-		}
-
-		if header.Name == layerPath {
-			// Found the layer blob - extract it using system tar
-			tarCmd := exec.Command("tar", "-xf", "-", "-C", destDir)
-			tarCmd.Stdin = tr
-			if output, err := tarCmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("tar extraction failed: %w\nOutput: %s", err, string(output))
-			}
-			return nil
-		}
+	// Extract the layer using system tar
+	tarCmd := exec.Command("tar", "-xf", "-", "-C", destDir)
+	tarCmd.Stdin = bytes.NewReader(layerContent)
+	if output, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar extraction failed: %w\nOutput: %s", err, string(output))
 	}
+
+	return nil
 }
 
 // hashURL generates a cache-safe hash of a URL
